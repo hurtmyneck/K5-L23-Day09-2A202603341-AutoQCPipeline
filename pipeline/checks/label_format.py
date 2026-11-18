@@ -21,9 +21,49 @@ Gợi ý
 - `iou_xywh(a, b)` có sẵn trong common.py.
 - Ngưỡng nằm trong `cfg["label_format"]` — đừng viết cứng số vào code.
 """
-from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
+from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line
 
 
 def run(ds, cfg):
-    # TODO: duyệt từng file nhãn, từng dòng
-    raise NotImplementedError("check label_format chưa làm")
+    c = cfg["label_format"]
+    n_cls = len(ds.classes)
+    issues = []
+
+    def add(sev, code, stem, msg, line, **extra):
+        issues.append(Issue("label_format", sev, code, stem, msg, line, extra))
+
+    for path in ds.label_files():
+        stem = path.stem
+        size = None            # chỉ mở ảnh khi thật sự cần (BOX_TINY)
+        seen = []              # các box hợp lệ ở dòng trước, để bắt DUP_BOX
+        for line, text in ds.read_label_lines(stem) or []:
+            try:
+                box = parse_yolo_line(text)
+            except ValueError as e:
+                add(ERROR, "BAD_FORMAT", stem, f"dòng nhãn sai định dạng: {e}", line)
+                continue
+            cid, x, y, w, h = box
+            if not 0 <= cid < n_cls:
+                add(ERROR, "BAD_CLASS_ID", stem, f"id lớp {cid} ngoài 0..{n_cls - 1}", line)
+                continue
+            if w <= 0 or h <= 0:
+                add(ERROR, "BOX_ZERO", stem, f"box rỗng (w={w}, h={h})", line)
+                continue
+
+            overflow = max(-(x - w / 2), (x + w / 2) - 1, -(y - h / 2), (y + h / 2) - 1)
+            if overflow > c["overflow_tol"]:
+                add(ERROR, "BOX_OUT_OF_IMAGE", stem, f"box tràn ảnh {overflow:.4f}", line, overflow=overflow)
+
+            for prev in seen:
+                if prev[0] == cid and iou_xywh(prev[1:], box[1:]) > c["dup_box_iou"]:
+                    add(ERROR, "DUP_BOX", stem, "box lặp với một dòng trước đó", line)
+                    break
+            seen.append(box)
+
+            if size is None:
+                size = ds.image_size(stem) or ()
+            if size and min(w * size[0], h * size[1]) < c["min_box_px"]:
+                add(WARN, "BOX_TINY", stem, f"box quá nhỏ ({min(w * size[0], h * size[1]):.1f}px)", line)
+            if w * h > c["max_box_frac"]:
+                add(WARN, "BOX_HUGE", stem, f"box chiếm {w * h:.0%} ảnh", line)
+    return issues

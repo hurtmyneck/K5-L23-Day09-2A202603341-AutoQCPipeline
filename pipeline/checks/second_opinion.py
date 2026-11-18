@@ -35,10 +35,55 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    c = cfg["second_opinion"]
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    issues = []
+
+    def add(code, stem, msg, line=None, **extra):
+        issues.append(Issue("second_opinion", WARN, code, stem, msg, line, extra))
+
+    for img in ds.image_files():
+        stem = img.stem
+        rows = ds.read_label_lines(stem)
+        if stem not in preds or rows is None:
+            continue
+        size = ds.image_size(stem)
+        if not size:
+            continue
+        W, H = size
+        labels = ds.valid_boxes(stem)
+
+        confident = [r for r in preds[stem]
+                     if r[1] >= c["conf"] and (r[4] * W) * (r[5] * H) >= c["min_area_px"]]
+        for r in confident:
+            cands = [(b[0], iou_xywh(r[2:6], b[1:])) for b in labels]
+            cands = [(k, v) for k, v in cands if v >= c["iou_missing"]]
+            if not cands:
+                add("POSSIBLE_MISSING", stem, "model thấy vật mà nhãn không có box", conf=r[1], cls=r[0])
+                continue
+            same = [v for k, v in cands if k == r[0]]
+            if same:
+                if max(same) < c["iou_loose"]:
+                    add("POSSIBLE_LOOSE_BOX", stem, "đúng vật, đúng lớp nhưng box lỏng/lệch", conf=r[1], iou=max(same))
+                continue
+            other = max(v for _, v in cands)
+            if other >= c["iou_match"]:
+                add("POSSIBLE_WRONG_CLASS", stem, f"model cho là lớp {r[0]}, nhãn gán lớp khác", conf=r[1], iou=other)
+
+        near = [r for r in preds[stem] if r[1] >= c["fp_conf"]]
+        for n, text in rows:
+            try:
+                b = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if not 0 <= b[0] < len(ds.classes):
+                continue
+            if all(iou_xywh(r[2:6], b[1:]) < c["iou_missing"] for r in near):
+                add("POSSIBLE_FALSE_POS", stem, "box nhãn không khớp vật nào model thấy", n)
+    return issues
